@@ -4,6 +4,7 @@ import subprocess
 import requests
 import os
 import json
+import re
 
 # ----------------------------
 # CONFIGURATION
@@ -91,17 +92,22 @@ def get_vnstat_usage(interface):
         return stats
 
 def get_ikev2_users():
-    """
-    Counts active IKEv2 connections by checking established Security Associations.
-    """
     try:
-        # Requires sudo privileges if not running the script as root
-        command = "sudo ipsec status | grep -c 'ESTABLISHED'"
-        result = subprocess.run(command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        # Fetch the raw output directly, no shell pipes needed
+        command = "sudo ipsec status"
+        result = subprocess.run(command, shell=True, stdout=subprocess.PIPE, text=True)
         
-        active_clients = result.stdout.strip()
-        return active_clients if active_clients.isdigit() else "0"
-    except Exception:
+        # Search the output for the exact phrase "Security Associations (X up"
+        # The (\d+) captures the digits representing the active user count
+        match = re.search(r"Security Associations \((\d+) up", result.stdout)
+        
+        if match:
+            total_clients = match.group(1)
+            return total_clients
+            
+        return "0"
+    except Exception as e:
+        print(f"[ERROR] Could not get IKEv2 clients: {e}")
         return "0"
 
 def get_cpu_usage_15min():
