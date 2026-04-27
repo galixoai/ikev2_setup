@@ -1,3 +1,5 @@
+
+
 ## Prerequisites
 - Server with Ubuntu 22.04 configured.
 - Update & upgrade the server.
@@ -6,7 +8,7 @@
 ### Prior Step:
 **Point the desired domain to the newly purchased server.**
 
-![Config Image](../assets/ikev2_dns_entry.png)
+![Config Image](assets/ikev2_dns_entry.png)
 
 ## 1. Install vnstat for Network Monitoring
 
@@ -50,7 +52,7 @@ You need to wait for it to complete. After the successful execution of the scrip
 
 Below is the SS of configurations.
 
-![Config Image](../assets/ikev2-config.png)
+![Config Image](assets/ikev2-config.png)
 
 
 **Step 04: Add the Schedules to the crontab**
@@ -72,7 +74,7 @@ Run these commands to allow ports and enable the firewall:
 
 ```bash
 sudo ufw allow from 38.180.244.244 comment 'VPN server IP'
-sudo ufw allow from 139.59.61.11 comment 'Backend server IP'
+sudo ufw allow from 139.59.23.10 comment 'Backend server IP'
 sudo ufw allow 4500
 sudo ufw allow 500
 
@@ -85,4 +87,3 @@ sudo ufw reload
 Add the file to the API [papi.fusionsai.net] under Desktop servers.
 
 If it connects successfully you can test it using `whatsmyip`.
-
