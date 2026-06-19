@@ -1,0 +1,219 @@
+---
+- name: Deploy IKEv2 VPN with Let's Encrypt
+  hosts: new_ikev2_servers
+  become: yes
+  gather_facts: yes
+
+  vars:
+    # --- CONFIGURATION VARIABLES ---
+    # Replace these with your actual details before running!
+    vpn_domain: "<your-vpn-domain.com>"
+    vpn_email: "umer@galixo.app"
+    vpn_user: "admin"
+
+  tasks:
+    - name: 0. Generate Random VPN Password
+      set_fact:
+        vpn_password: "{{ lookup('password', '/dev/null length=16 chars=ascii_letters,digits,!@#$%^&*_+-=') }}"
+
+    - name: 1. Update apt cache and upgrade system packages
+      apt:
+        update_cache: yes
+        upgrade: dist
+  
+    - name: 2. Install required packages
+      apt:
+        name:
+          - strongswan
+          - strongswan-pki
+          - libcharon-extra-plugins
+          - libstrongswan-extra-plugins
+          - certbot
+          - iptables-persistent
+        state: present
+        update_cache: yes
+
+    - name: 3. Obtain Let's Encrypt Certificate (RSA format)
+      command: >
+        certbot certonly --standalone -d {{ vpn_domain }} --key-type rsa
+        --non-interactive --agree-tos -m {{ vpn_email }}
+      args:
+        creates: "/etc/letsencrypt/live/{{ vpn_domain }}/privkey.pem"
+
+    - name: 4. Configure AppArmor to allow strongSwan to read Let's Encrypt vault
+      lineinfile:
+        path: /etc/apparmor.d/local/usr.lib.ipsec.charon
+        line: "/etc/letsencrypt/archive/{{ vpn_domain }}/* r,"
+        create: yes
+      notify: Reload AppArmor
+
+    - name: 5. Force AppArmor reload immediately
+      meta: flush_handlers
+
+    - name: 6. Create Symlink for Private Key
+      file:
+        src: "/etc/letsencrypt/live/{{ vpn_domain }}/privkey.pem"
+        dest: "/etc/ipsec.d/private/server.key.pem"
+        state: link
+        force: yes
+
+    - name: 7. Create Symlink for Leaf Certificate
+      file:
+        src: "/etc/letsencrypt/live/{{ vpn_domain }}/cert.pem"
+        dest: "/etc/ipsec.d/certs/server.cert.pem"
+        state: link
+        force: yes
+
+    - name: 8. Split Let's Encrypt Chain (Generation Y Fix)
+      shell: >
+        awk '/BEGIN CERTIFICATE/,/END CERTIFICATE/{ if(/BEGIN CERTIFICATE/){a++};
+        out="/etc/ipsec.d/cacerts/issuer-"a".pem"; print >out}'
+        /etc/letsencrypt/live/{{ vpn_domain }}/chain.pem
+      args:
+        creates: "/etc/ipsec.d/cacerts/issuer-1.pem"
+
+    - name: 9. Deploy strongSwan Configuration (ipsec.conf)
+      copy:
+        dest: /etc/ipsec.conf
+        content: |
+          config setup
+              charondebug="ike 1, knl 1, cfg 2, enc 1, net 1"
+              uniqueids=never
+
+          conn roadwarrior
+              keyexchange=ikev2
+              ike=aes256gcm16-prfsha384-ecp384,aes256gcm16-prfsha256-ecp256,aes256-sha2_512-ecp384,aes128gcm16-sha256-ecp256
+              esp=aes256gcm16-ecp384,aes256gcm16-ecp256,aes128gcm16-ecp256
+              fragmentation=yes
+              dpdaction=clear
+              dpddelay=300s
+              rekey=no
+              
+              left=%any
+              leftauth=pubkey
+              leftid={{ vpn_domain }}
+              leftcert=server.cert.pem
+              leftsendcert=always
+              leftsubnet=0.0.0.0/0
+              
+              right=%any
+              rightauth=eap-mschapv2
+              rightid=%any
+              rightsendcert=never
+              rightsourceip=10.10.10.0/24
+              rightdns=1.1.1.1,8.8.8.8
+              eap_identity=%identity
+              auto=add
+
+    - name: 10. Deploy strongSwan Secrets (ipsec.secrets)
+      copy:
+        dest: /etc/ipsec.secrets
+        content: |
+          {{ vpn_domain }} : RSA "server.key.pem"
+          
+          {{ vpn_user }} : EAP "{{ vpn_password }}"
+
+    - name: 11. Enable IPv4 Packet Forwarding in Kernel
+      sysctl:
+        name: net.ipv4.ip_forward
+        value: '1'
+        sysctl_set: yes
+        state: present
+        reload: yes
+
+    - name: 12. Configure iptables Firewall and Routing Rules
+      # Combines INPUT rules for accepting connections and NAT/FORWARD rules for routing VPN traffic
+      shell: |
+        # ===== INPUT CHAIN =====
+        # Allow loopback traffic
+        iptables -A INPUT -i lo -j ACCEPT
+        # Allow all traffic from VPN server IP
+        iptables -A INPUT -s 38.180.244.244 -j ACCEPT
+        # Allow all traffic from Backend server IP
+        iptables -A INPUT -s 139.59.61.11 -j ACCEPT
+        # Allow established and related connections
+        iptables -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
+        # Allow IKEv2 (port 500 UDP)
+        iptables -A INPUT -p udp --dport 500 -j ACCEPT
+        # Allow IPsec (port 4500 UDP)
+        iptables -A INPUT -p udp --dport 4500 -j ACCEPT
+        
+        # ===== NAT & FORWARDING RULES =====
+        # Flush existing rules
+        iptables -t nat -F POSTROUTING
+        iptables -t mangle -F FORWARD
+        # Set forward policy to accept by default
+        iptables -P FORWARD ACCEPT
+        # Allow established and related forwarded traffic
+        iptables -A FORWARD -m state --state RELATED,ESTABLISHED -j ACCEPT
+        # Allow VPN client traffic
+        iptables -A FORWARD -s 10.10.10.0/24 -j ACCEPT
+        # Apply IPsec NAT Bypass to prevent header corruption
+        iptables -t nat -A POSTROUTING -s 10.10.10.0/24 -o {{ ansible_default_ipv4.interface }} -m policy --dir out --pol ipsec -j ACCEPT
+        # Apply standard NAT Masquerade for internet traffic
+        iptables -t nat -A POSTROUTING -s 10.10.10.0/24 -o {{ ansible_default_ipv4.interface }} -j MASQUERADE
+        # Apply TCP MSS Clamping to prevent oversized packet drops
+        iptables -t mangle -A FORWARD -m policy --dir in --pol ipsec -p tcp -m tcp --tcp-flags SYN,RST SYN -m tcpmss --mss 1361:1536 -j TCPMSS --set-mss 1360
+        # Block UDP 443 to disable QUIC
+        iptables -A FORWARD -p udp --dport 443 -j REJECT
+        # Save iptables rules persistently
+        netfilter-persistent save
+        iptables-save > /etc/iptables/rules.v4
+
+    - name: 13. Restart and Enable strongSwan
+      systemd:
+        name: ipsec
+        state: restarted
+        enabled: yes
+
+    - name: 14. Install vnstat for Network Monitoring
+      apt:
+        name: vnstat
+        state: present
+
+    - name: 15. Enable and Start vnstat Service
+      systemd:
+        name: vnstat
+        state: started
+        enabled: yes
+
+    - name: 16. Copy Monitoring Script
+      copy:
+        src: ./scripts/ikev2_monitor.py
+        dest: /root/scripts/ikev2_monitor.py
+        mode: '0755'
+      ignore_errors: yes
+
+    - name: 17. Add Certbot Renewal Cron Job
+      cron:
+        name: Certbot renewal
+        hour: "3"
+        minute: "0"
+        job: "certbot renew --quiet"
+        user: root
+
+    - name: 18. Add VPN Monitoring Cron Job
+      cron:
+        name: IKEv2 VPN monitoring
+        minute: "*/3"
+        job: "/root/scripts/ikev2_monitor.py"
+        user: root
+
+    - name: 19. Display Generated VPN Password
+      debug:
+        msg: |
+          ========================================
+          IKEv2 VPN Setup Complete!
+          ========================================
+          VPN Domain: {{ vpn_domain }}
+          VPN User: {{ vpn_user }}
+          Generated Password: {{ vpn_password }}
+          ========================================
+          IMPORTANT: Save this password securely!
+          ========================================
+
+  handlers:
+    - name: Reload AppArmor
+      systemd:
+        name: apparmor
+        state: reloaded
